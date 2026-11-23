@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# xcproj-version.sh
+# Usage: ./xcproj-version.sh <set|reset> <Project.xcodeproj>
+#
+# Optional: OBJECT_VERSION=77 ./xcproj-version.sh set Project.xcodeproj
+#           (overrides the automatic objectVersion mapping)
+
+set -u
+
+if [ -t 1 ]; then
+  BLUE=$'\033[1;34m'; RED=$'\033[1;31m'; GREEN=$'\033[1;32m'
+  YELLOW=$'\033[1;33m'; RESET=$'\033[0m'
+else
+  BLUE=''; RED=''; GREEN=''; YELLOW=''; RESET=''
+fi
+
+KEYS="objectVersion preferredProjectObjectVersion LastSwiftUpdateCheck LastUpgradeCheck CreatedOnToolsVersion IPHONEOS_DEPLOYMENT_TARGET"
+
+die()  { printf '%s%s%s\n' "$RED" "$*" "$RESET" >&2; exit 1; }
+warn() { printf '%s%s%s\n' "$YELLOW" "$*" "$RESET"; }
+ok()   { printf '%s%s%s\n' "$GREEN" "$*" "$RESET"; }
+
+usage() {
+  echo "${RED}Usage: ${RESET}$0 <set|reset> <Project.xcodeproj>" >&2
+  exit 1
+}
+
+# Print every value of KEY in file order, one per line
+get_vals() {
+  awk -v key="$2" '
+    $0 ~ "^[ \t]*" key " = " {
+      s = $0
+      sub(/^[^=]*= /, "", s)
+      sub(/;.*/, "", s)
+      print s
+    }' "$1"
+}
+
+uniq_join() { sort -u | paste -sd, - | sed 's/,/, /g'; }
+
+# Replace the Nth occurrence of KEY with the Nth value in VALS (newline separated).
+# If there are fewer values than occurrences, the last value is reused.
+set_key() {
+  local file=$1 key=$2 vals=$3 tmp
+  [ -n "$vals" ] || return 0
+  tmp=$(mktemp) || die "mktemp failed"
+  VALS="$vals" awk -v key="$key" '
+    BEGIN { cnt = split(ENVIRON["VALS"], v, "\n"); n = 0 }
+    {
+      line = $0
+      if (match(line, "^[ \t]*" key " = ")) {
+        n++
+        nv = (n <= cnt) ? v[n] : v[cnt]
+        sub(/= [^;]*;/, "= " nv ";", line)
+      }
+      print line
+    }' "$file" > "$tmp" && cat "$tmp" > "$file" || { rm -f "$tmp"; die "Failed to update $key"; }
+  rm -f "$tmp"
+}
+
+object_version_for() {
+  local m=$1
+  if   [ "$m" -ge 26 ]; then echo 70
+  elif [ "$m" -ge 16 ]; then echo 77
+  elif [ "$m" -ge 15 ]; then echo 60
+  elif [ "$m" -ge 14 ]; then echo 56
+  elif [ "$m" -ge 13 ]; then echo 55
+  elif [ "$m" -ge 12 ]; then echo 54
+  elif [ "$m" -ge 11 ]; then echo 52
+  elif [ "$m" -ge 10 ]; then echo 51
+  else echo 46
+  fi
+}
+
+show_current() {
+  local f=$1 k
+  for k in $KEYS; do
+    printf '  %-32s %s%s%s\n' "$k" "$BLUE" "$(get_vals "$f" "$k" | uniq_join)" "$RESET"
+  done
+}
+
+# ---------- args ----------
+MODE=${1:-}
+PROJ=${2:-}
+case "$MODE" in
+  set)        ;;
+  reset|rest) MODE=reset ;;
+  *)          usage ;;
+esac
+[ -n "$PROJ" ] || usage
+
+PROJ="${PROJ%/}"
+case "$PROJ" in *.xcodeproj) ;; *) die "Not an .xcodeproj: $PROJ" ;; esac
+[ -d "$PROJ" ] || die "Directory not found: $PROJ"
+PBX="$PROJ/project.pbxproj"
+[ -f "$PBX" ] || die "project.pbxproj not found in: $PROJ"
+
+PARENT="$(cd "$(dirname "$PROJ")" && pwd)"
+NAME="$(basename "$PROJ" .xcodeproj)"
+BACKUP="$PARENT/$NAME.project.pbxproj.bak"
+
+# ---------- reset ----------
+if [ "$MODE" = reset ]; then
+  [ -f "$BACKUP" ] || die "Backup not found: $BACKUP"
+
+  for k in $KEYS; do
+    set_key "$PBX" "$k" "$(get_vals "$BACKUP" "$k")"
+  done
+
+  bad=0
+  for k in $KEYS; do
+    b=$(get_vals "$BACKUP" "$k")
+    [ -n "$b" ] || continue
+    n=$(printf '%s\n' "$b" | wc -l | tr -d ' ')
+    c=$(get_vals "$PBX" "$k" | head -n "$n")
+    [ "$b" = "$c" ] || { warn "Mismatch after restore: $k"; bad=1; }
+  done
+
+  echo "Restored values:"
+  show_current "$PBX"
+  if [ "$bad" -eq 0 ]; then
+    rm -f "$BACKUP"
+    ok "Done. Values restored from backup (backup removed)."
+  else
+    warn "Some values differ. Backup kept: $BACKUP"
+  fi
+  exit 0
+fi
+
+# ---------- set ----------
+SRC="$PBX"
+[ -f "$BACKUP" ] && SRC="$BACKUP"
+
+orig_xcode=$(get_vals "$SRC" CreatedOnToolsVersion | uniq_join)
+if [ -z "$orig_xcode" ]; then
+  n=$(get_vals "$SRC" LastUpgradeCheck | head -n 1)
+  if [ -n "$n" ]; then
+    orig_xcode="$(( n / 100 )).$(( (n / 10) % 10 )).$(( n % 10 ))"
+    orig_xcode="${orig_xcode%.0}"
+  else
+    orig_xcode="unknown"
+  fi
+fi
+orig_target=$(get_vals "$SRC" IPHONEOS_DEPLOYMENT_TARGET | uniq_join)
+[ -n "$orig_target" ] || orig_target="not found"
+
+printf 'Original Xcode version      : %s%s%s\n' "$BLUE" "$orig_xcode" "$RESET"
+printf 'IPHONEOS_DEPLOYMENT_TARGET  : %s%s%s\n' "$BLUE" "$orig_target" "$RESET"
+echo
+
+VER_RE='^[0-9]+(\.[0-9]+){0,2}$'
+
+while :; do
+  read -r -p "New Xcode version (required, e.g. 26.6): " XC || exit 1
+  if [[ $XC =~ $VER_RE ]]; then break; fi
+  warn "Invalid version, try again."
+done
+case "$XC" in *.*) ;; *) XC="$XC.0" ;; esac
+
+while :; do
+  read -r -p "New iOS deployment target (Enter = keep '$orig_target'): " IOS || exit 1
+  if [ -z "$IOS" ] || [[ $IOS =~ $VER_RE ]]; then break; fi
+  warn "Invalid version, try again."
+done
+
+IFS=. read -r MAJ MIN PAT <<< "$XC"
+MAJ=$((10#$MAJ)); MIN=$((10#${MIN:-0})); PAT=$((10#${PAT:-0}))
+CHECK=$(( MAJ * 100 + MIN * 10 + PAT ))
+OBJ=${OBJECT_VERSION:-$(object_version_for "$MAJ")}
+
+# ---------- backup (kept untouched if it already exists) ----------
+if [ -f "$BACKUP" ]; then
+  warn "Backup already exists, keeping the original: $BACKUP"
+else
+  cp -p "$PBX" "$BACKUP" || die "Backup failed"
+  ok "Backup created: $BACKUP"
+fi
+
+# ---------- apply ----------
+set_key "$PBX" objectVersion                 "$OBJ"
+set_key "$PBX" preferredProjectObjectVersion "$OBJ"
+set_key "$PBX" LastSwiftUpdateCheck          "$CHECK"
+set_key "$PBX" LastUpgradeCheck              "$CHECK"
+set_key "$PBX" CreatedOnToolsVersion         "$XC"
+[ -n "$IOS" ] && set_key "$PBX" IPHONEOS_DEPLOYMENT_TARGET "$IOS"
+
+echo
+echo "New values:"
+show_current "$PBX"
+ok "Done."
+
